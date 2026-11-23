@@ -1,0 +1,1246 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const createPlugin = require('../client-source.cjs');
+const model = require('../model.cjs');
+const persistence = require('../storage.cjs');
+
+const KEY = 'dsh.session-hub.v1';
+const WORKSPACES = 'sidebar.workspaces';
+const MENU = WORKSPACES + '.session.menu.item';
+const ROW_ACTION = WORKSPACES + '.session.row.action';
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const event = options => ({
+  ctrlKey: false, metaKey: false, shiftKey: false, detail: 1,
+  stopPropagation() {}, preventDefault() {},
+  dataTransfer: { setData() {} }, clientY: 16, currentTarget: { getBoundingClientRect: () => ({ top: 0, height: 32 }) }, ...options,
+});
+
+// This harness runs hook state/effect lifetimes, not browser layout or React reconciliation.
+function renderer() {
+  const instances = new Map();
+  let current, index;
+  const pending = [];
+  const React = {
+    createElement(type, props, ...children) { return { type, props: { ...props, children }, children }; },
+    useState(initial) {
+      const owner = current, slot = index++;
+      if (!(slot in owner)) owner[slot] = typeof initial === 'function' ? initial() : initial;
+      return [owner[slot], value => { owner[slot] = typeof value === 'function' ? value(owner[slot]) : value; }];
+    },
+    useRef(initial) {
+      const [ref] = React.useState(() => ({ current: initial }));
+      return ref;
+    },
+    useEffect(effect, deps) {
+      const owner = current, slot = index++, previous = owner[slot];
+      if (previous && deps && deps.length === previous.deps?.length && deps.every((value, i) => Object.is(value, previous.deps[i]))) return;
+      pending.push(() => {
+        previous?.cleanup?.();
+        owner[slot] = { deps, cleanup: effect() };
+      });
+    },
+    useSyncExternalStore(subscribe, getSnapshot) {
+      React.useEffect(() => subscribe(() => {}), [subscribe]);
+      return getSnapshot();
+    },
+  };
+  function resolve(node, path) {
+    if (Array.isArray(node)) return node.flatMap((child, i) => resolve(child, path + '.' + i));
+    if (node === null || node === undefined || typeof node === 'boolean') return [];
+    if (typeof node !== 'object') return [node];
+    if (typeof node.type === 'function') {
+      const id = path + ':' + node.type.name + ':' + (node.props.key ?? '');
+      if (!instances.has(id)) instances.set(id, []);
+      const previous = current, previousIndex = index;
+      current = instances.get(id); index = 0;
+      const output = node.type(node.props);
+      current = previous; index = previousIndex;
+      return resolve(output, id);
+    }
+    const host = { ...node, children: resolve(node.children, path + '.children') };
+    host.props.ref && (host.props.ref.current = {
+      showModal() {}, close() {}, focus() {}, querySelectorAll() { return []; }, querySelector() { return null; },
+    });
+    return [host];
+  }
+  return {
+    React,
+    render(component, props) {
+      const result = resolve(React.createElement(component, props), 'root')[0];
+      while (pending.length) pending.shift()();
+      return result;
+    },
+    unmount() {
+      for (const hooks of instances.values()) for (const hook of hooks) hook?.cleanup?.();
+      instances.clear();
+    },
+  };
+}
+
+function nodes(root, predicate) {
+  if (!root || typeof root !== 'object') return [];
+  return [...(predicate(root) ? [root] : []), ...root.children.flatMap(child => nodes(child, predicate))];
+}
+const text = node => typeof node === 'object' && node ? node.children.map(text).join('') : String(node ?? '');
+function button(root, label) {
+  const match = nodes(root, node => node.type === 'button' && (node.props['aria-label'] ?? text(node)) === label)[0];
+  if (match) return match;
+  const menu = nodes(root, node => node.type === 'native-menu' && node.props.items.some(item => item.label === label))[0];
+  assert.ok(menu, `Expected button or native menu item ${label}`);
+  const item = menu.props.items.find(item => item.label === label);
+  return { props: { disabled: item.disabled, onClick: () => menu.props.onSelect(item.id) } };
+}
+// Delete dialog: optional "also archive" checkbox, then the single danger Delete button.
+async function confirmDelete(app, archive) {
+  let tree = app.render();
+  if (archive) { nodes(tree, node => node.type === 'native-checkbox')[0].props.onChange(true); tree = app.render(); }
+  await app.click(nodes(tree, node => node.type === 'button' && text(node) === 'Delete')[0]);
+}
+function row(root, key) {
+  const match = nodes(root, node => node.props['data-dsm-key'] === key)[0];
+  assert.ok(match, `Expected row ${key}`);
+  return match;
+}
+function source(value) {
+  const listeners = new Set();
+  return { value, listeners, list: {
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    getSnapshot: () => value,
+  } };
+}
+function fixtureState() {
+  let state = model.initialState();
+  state = model.createFolder(state, { id: 'a', workspaceId: 'w', name: 'Alpha' });
+  state = model.createFolder(state, { id: 'b', workspaceId: 'w', name: 'Beta' });
+  return state;
+}
+
+function setup(t, { state = fixtureState(), raw = JSON.stringify(state), compatible = true, mode = null,
+  legacyArchive = true, uiArchive = true, other = {} } = {}) {
+  const previousWindow = global.window;
+  const previousError = console.error, previousWarn = console.warn;
+  const errors = [], warnings = [], calls = [], effects = [], windowListeners = new Map();
+  console.error = (...args) => errors.push(args);
+  console.warn = (...args) => warnings.push(args);
+  const MODE = 'dsh.session-hub.tree-view';
+  const storage = { raw, writes: 0, mode, other: { ...other },
+    getItem: key => key === KEY ? storage.raw : key === MODE ? storage.mode : storage.other[key] ?? null,
+    setItem(key, value) { if (key === MODE) { storage.mode = value; return; } if (key !== KEY) { storage.other[key] = value; return; } storage.raw = value; storage.writes++; },
+    removeItem(key) { delete storage.other[key]; },
+    // Host storage surface: subscribers hear keys another shell (or a rejected write) changed.
+    listeners: new Set(),
+    subscribe(listener) { storage.listeners.add(listener); return () => storage.listeners.delete(listener); },
+    refresh() { calls.push(['refresh']); },
+    emit(key, failure) { for (const listener of [...storage.listeners]) listener(key, failure); } };
+  const listen = {
+    addEventListener(name, callback) { if (!windowListeners.has(name)) windowListeners.set(name, new Set()); windowListeners.get(name).add(callback); },
+    removeEventListener(name, callback) { windowListeners.get(name)?.delete(callback); },
+  };
+  const previousDocument = global.document;
+  global.window = { ...listen };
+  global.document = { ...listen, visibilityState: 'visible', baseURI: 'http://127.0.0.1/' };
+  const sessions = source({ phase: 'ready', ids: ['s1', 's2', 'blank', 'archived', 'orphan'], byId: {
+    s1: { id: 's1', title: '  First  ', displayTitle: 'First', updatedAt: 20, running: false },
+    s2: { id: 's2', title: 'Second', displayTitle: 'Second', updatedAt: 10, running: false },
+    blank: { id: 'blank', displayTitle: 'New session', blank: true, retainedBy: { mainView: 1 }, updatedAt: 30 },
+    archived: { id: 'archived', title: 'Old', updatedAt: 0 },
+    orphan: { id: 'orphan', title: 'Ungrouped session', updatedAt: 0 },
+  } });
+  const workspaces = source({ phase: 'ready', items: [{ workspaceId: 'w', path: 'E:/work', title: 'Work', sessionIds: ['s1', 's2', 'blank', 'archived'] }],
+    archivedSessionIds: ['archived'], pinnedSessionIds: ['s2'] });
+  sessions.create = async input => { calls.push(['createSession', input]); return 'created'; };
+  sessions.search = async (query, signal) => { calls.push(['searchContent', query, signal]); return { ok: true, value: { items: [], hasMore: false } }; };
+  const shortcuts = source({ searchRequest: 0 });
+  const requestSearch = () => { calls.push(['search']); shortcuts.value.searchRequest++; for (const listener of shortcuts.listeners) listener(); };
+  const native = { options: { priority: 0 }, inject: () => ({ requestSessionRename: (...args) => calls.push(['rename', ...args]),
+    requestSearch, hooks: { workspaceShortcuts: shortcuts.list } }) };
+  const archive = { options: { id: 'archive' }, inject: () => ({ archiveSession: id => calls.push(['archive-native', id]) }) };
+  const entries = new Map([[WORKSPACES, compatible ? [native] : []], [legacyArchive ? MENU : ROW_ACTION, [archive]]]);
+  const subscriptions = new Map();
+  const emit = key => { for (const listener of [...(subscriptions.get(key) || [])]) listener(); };
+  const slots = {
+    inject: (key, action) => action(),
+    entries: key => entries.get(key) || [],
+    subscribe(key, listener) {
+      if (!subscriptions.has(key)) subscriptions.set(key, new Set());
+      subscriptions.get(key).add(listener);
+      return () => subscriptions.get(key).delete(listener);
+    },
+    register(options, component) {
+      const entry = { options, component };
+      if (!entries.has(options.name)) entries.set(options.name, []);
+      entries.get(options.name).push(entry); emit(options.name);
+      calls.push(['register', options.name, options.priority]);
+      return () => {
+        entries.set(options.name, entries.get(options.name).filter(value => value !== entry));
+        calls.push(['dispose', options.name, options.priority]); emit(options.name);
+      };
+    },
+  };
+  const uiWorkspace = Object.fromEntries(['openSession', 'pinSession', 'unpinSession', 'unarchiveSession']
+    .map(name => [name, id => { calls.push([name, id]); }]));
+  if (uiArchive) uiWorkspace.archiveSession = id => { calls.push(['archiveSession', id]); };
+  uiWorkspace.openWorkspace = async (workspaceId, beforeOpen) => {
+    calls.push(['openWorkspace', workspaceId]); beforeOpen('created');
+  };
+  let dictionaries;
+  const ctx = { slots, sessions, workspaces, uiWorkspace,
+    locale: {
+      register(namespace, value) { dictionaries = value; calls.push(['locale', namespace]); return () => calls.push(['locale-dispose', namespace]); },
+      bind: () => (key, values = {}) => dictionaries.en[key]?.replace(/\{(\w+)\}/g, (_, name) => values[name]),
+    },
+    effect(action) { const cleanup = action(); if (typeof cleanup === 'function') effects.push(cleanup); },
+  };
+  const view = renderer();
+  let tree;
+  const ui = new Proxy({
+    Modal: props => view.React.createElement('native-modal', props, props.children, props.footer),
+    Button: props => view.React.createElement('button', props, props.children),
+    Menu: props => view.React.createElement('native-menu', props, props.anchor, props.open && props.children),
+    HoverCard: props => view.React.createElement('native-hovercard', props, props.anchor),
+    StateDot: props => view.React.createElement('native-state-dot', props),
+    Switch: props => view.React.createElement('native-switch', props),
+    Toast: props => view.React.createElement('native-toast', props, props.text),
+    Input: props => view.React.createElement('input', props),
+    Checkbox: props => view.React.createElement('native-checkbox', props, props.label),
+    relativeTime: () => ({ unit: 'minutes', n: 1 }),
+  }, { get: (target, key) => target[key] || (props => view.React.createElement('native-icon', { ...props, name: key })) });
+  // Synchronous stand-in for the host fetch so apply() finishes before the test renders.
+  const hostPersistence = { ...persistence, openHostStorage(url) {
+    calls.push(['open', url]);
+    return { then(resolve) {
+      try { resolve(storage); } catch (error) { return { catch(handle) { handle(error); } }; }
+      return { catch() {} };
+    } };
+  } };
+  const plugin = createPlugin(view.React, model, hostPersistence, ui);
+  plugin.apply(ctx);
+  function render(props = {}) {
+    const registered = entries.get(WORKSPACES).find(entry => entry.options.priority === -10);
+    assert.ok(registered, 'Expected custom tree registration');
+    tree = view.render(registered.component, { wide: true, expandSidebar() { calls.push(['expand']); },
+      useSessionStatus: selector => { assert.equal(typeof selector, 'function'); return selector(new Map()); },
+      usePanelInfo: selector => { assert.equal(typeof selector, 'function'); return selector({ activePanelId: null }); }, ...props });
+    return tree;
+  }
+  async function click(target, options) { assert.notEqual(target.props.disabled, true); target.props.onClick(event(options)); await flush(); }
+  const cleanup = () => { view.unmount(); while (effects.length) effects.pop()(); };
+  t.after(() => { cleanup(); global.window = previousWindow; global.document = previousDocument; console.error = previousError; console.warn = previousWarn; });
+  return { plugin, ctx, slots, entries, native, archive, calls, errors, warnings, storage, subscriptions, sessions, workspaces,
+    windowListeners, render, click, emit, cleanup, renderSettings: () => view.render(entries.get('settings.section')[0].component, {}), renderToggle: () => nodes(view.render(entries.get('settings.section')[0].component, {}), node => node.type === 'native-switch')[0], get tree() { return tree; } };
+}
+
+test('folder summary uses native icons, hides zero groups, and updates while collapsed without storage writes', t => {
+  const state = { ...fixtureState(), sessionFolders: { s1: 'a', s2: 'a', archived: 'a' }, expanded: { 'folder:a': false } };
+  const app = setup(t, { state });
+  const statuses = new Map([['s1', { pendingInteraction: { kind: 'approval' }, running: true }], ['s2', { completionUnread: true }], ['archived', { running: true }]]);
+  const render = () => app.render({ useSessionStatus: selector => selector(statuses) });
+  let tree = render();
+  let folder = row(tree, 'folder:a');
+  assert.equal(folder.props['aria-expanded'], false);
+  assert.equal(nodes(folder, n => n.props['data-activity'] === 'pending').length, 1);
+  assert.equal(nodes(folder, n => n.props['data-activity'] === 'running').length, 0);
+  assert.equal(nodes(folder, n => n.props['data-activity'] === 'unread').length, 1);
+  assert.ok(nodes(folder, n => n.props.name === 'IconWarningOutlineRegular').length);
+  assert.ok(nodes(folder, n => n.props.name === 'IconCheckCircleOutlineRegular').length);
+  assert.equal(nodes(folder, n => n.type === 'native-hovercard').length, 0);
+  const pendingMenu = nodes(folder, n => n.type === 'native-menu' && n.props.className === 'dsmgr-folder-count')[0];
+  assert.equal(pendingMenu.props.anchor.props['aria-label'], 'Needs attention: 1, show');
+  assert.equal(pendingMenu.props.footer[0].text, 'Includes subfolders · Idle 0 · Unarchived sessions 2');
+  statuses.set('s1', { running: true });
+  folder = row(render(), 'folder:a');
+  assert.ok(nodes(folder, n => n.type === 'native-state-dot' && n.props.state === 'ongoing' && n.props.size === 14).length);
+  statuses.clear();
+  folder = row(render(), 'folder:a');
+  assert.equal(nodes(folder, n => n.props.className === 'dsmgr-folder-summary').length, 0);
+  assert.equal(app.storage.writes, 0);
+});
+
+test('activity counts jump to their sessions: one opens directly, several open a menu, collapsed parents expand', async t => {
+  const state = { ...fixtureState(), sessionFolders: { s1: 'a', s2: 'a' }, expanded: { 'folder:a': false, 'workspace:"w"': false } };
+  const app = setup(t, { state });
+  const statuses = new Map([['s1', { pendingInteraction: { kind: 'approval' } }], ['s2', { pendingInteraction: { kind: 'input' } }], ['orphan', { completionUnread: true }]]);
+  const render = () => app.render({ useSessionStatus: selector => selector(statuses) });
+  const count = (root, kind) => nodes(root, n => n.type === 'native-menu' && n.props.className === 'dsmgr-folder-count' && n.props.anchor.props['data-activity'] === kind)[0];
+  const header = () => nodes(render(), n => n.type === 'header')[0];
+  await app.click(count(header(), 'pending').props.anchor);
+  const menu = count(header(), 'pending');
+  assert.equal(menu.props.open, true);
+  assert.deepEqual(menu.props.items.map(item => item.id), ['s1', 's2']);
+  menu.props.onSelect('s2');
+  await flush();
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's2']);
+  assert.deepEqual(JSON.parse(app.storage.raw).expanded, { 'folder:a': true, 'workspace:"w"': true });
+  await app.click(count(header(), 'unread').props.anchor);
+  assert.deepEqual(app.calls.at(-1), ['openSession', 'orphan']);
+});
+
+test('workspace rows and the header show the same summary, including ungrouped sessions in the header total', t => {
+  const state = { ...fixtureState(), expanded: { 'workspace:"w"': false } };
+  const app = setup(t, { state });
+  const statuses = new Map([['s1', { running: true }], ['orphan', { completionUnread: true }]]);
+  const tree = app.render({ useSessionStatus: selector => selector(statuses) });
+  const summaries = root => nodes(root, n => n.props.className === 'dsmgr-folder-summary');
+  const workspace = nodes(tree, n => n.props.className === 'dsmgr-row dsmgr-workspace').find(n => text(n).includes('Work'));
+  assert.equal(workspace.props['aria-expanded'], false);
+  const [own] = summaries(workspace);
+  const menus = root => nodes(root, n => n.type === 'native-menu' && n.props.className === 'dsmgr-folder-count');
+  assert.deepEqual(menus(own).map(m => m.props.anchor.props['aria-label']), ['Running: 1, show']);
+  assert.equal(menus(own)[0].props.footer[0].text, 'Includes all folders in this workspace · Idle 1 · Unarchived sessions 2');
+  const header = nodes(tree, n => n.type === 'header')[0];
+  const [all] = summaries(header);
+  assert.deepEqual(menus(all).map(m => m.props.anchor.props['data-activity']), ['running', 'unread']);
+  assert.equal(menus(all)[0].props.footer[0].text, 'All workspaces, including ungrouped · Idle 1 · Unarchived sessions 3');
+});
+
+test('factory declares dependencies and apply shadows native using options metadata, then cleans up', t => {
+  const app = setup(t);
+  assert.deepEqual(app.plugin.inject, ['slots', 'sessions', 'workspaces', 'uiWorkspace', 'locale']);
+  assert.deepEqual(app.calls.filter(call => call[0] === 'register' && call[1] === WORKSPACES), [['register', WORKSPACES, -10]]);
+  assert.equal(app.entries.get(WORKSPACES).includes(app.native), true);
+  app.render();
+  assert.deepEqual(app.calls.find(call => call[0] === 'open'), ['open', 'http://127.0.0.1/dsh-session-hub/storage']);
+  assert.equal(app.storage.listeners.size, 2);
+  assert.equal(app.windowListeners.get('focus').size, 1);
+  assert.equal(app.windowListeners.get('visibilitychange').size, 1);
+  assert.equal(app.sessions.listeners.size, 1);
+  app.cleanup();
+  assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
+  assert.equal(app.subscriptions.get(WORKSPACES).size, 0);
+  assert.equal(app.subscriptions.get(MENU).size, 0);
+  assert.equal(app.storage.listeners.size, 0);
+  assert.equal(app.windowListeners.get('focus').size, 0);
+  assert.equal(app.windowListeners.get('visibilitychange').size, 0);
+  assert.equal(app.sessions.listeners.size, 0);
+  assert.ok(app.calls.some(call => call[0] === 'locale-dispose'));
+});
+
+test('incompatible native API retains original list and hot registration changes reconcile', t => {
+  const app = setup(t, { compatible: false, legacyArchive: false, uiArchive: false });
+  assert.equal(app.entries.get(WORKSPACES).length, 0);
+  app.entries.get(WORKSPACES).push(app.native); app.emit(WORKSPACES);
+  assert.equal(app.entries.get(WORKSPACES).length, 2);
+  app.entries.set(ROW_ACTION, []); app.emit(ROW_ACTION);
+  assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
+  assert.equal(app.warnings.length, 1);
+  app.entries.set(ROW_ACTION, [app.archive]); app.emit(ROW_ACTION);
+  assert.equal(app.entries.get(WORKSPACES).length, 2);
+});
+
+// DSH 0.2.2 moved Archive out of the session menu into a row action and exposed it on uiWorkspace.
+test('a 0.2.2 shell without the legacy session menu still registers the tree', async t => {
+  const app = setup(t, { legacyArchive: false });
+  assert.equal(app.entries.get(WORKSPACES).length, 2);
+  const tree = app.render();
+  await app.click(button(row(tree, 'session:s1'), 'Archive'));
+  assert.deepEqual(app.calls.at(-1), ['archive-native', 's1']);
+});
+
+test('archive falls back to uiWorkspace when no slot entry injects it', async t => {
+  const app = setup(t, { legacyArchive: false, uiArchive: true });
+  app.entries.set(ROW_ACTION, []); app.emit(ROW_ACTION);
+  assert.equal(app.entries.get(WORKSPACES).length, 2);
+  const tree = app.render();
+  await app.click(button(row(tree, 'session:s1'), 'Archive'));
+  assert.deepEqual(app.calls.at(-1), ['archiveSession', 's1']);
+});
+
+test('corrupt persistence preserves native list and bytes without writing', t => {
+  const app = setup(t, { raw: '{broken' });
+  assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
+  assert.equal(app.storage.raw, '{broken');
+  assert.equal(app.storage.writes, 0);
+  assert.equal(app.errors.length, 1);
+});
+
+test('narrow sidebar expands instead of rendering tree', async t => {
+  const app = setup(t);
+  const tree = app.render({ wide: false });
+  assert.equal(tree.type, 'button');
+  tree.props.onClick();
+  assert.deepEqual(app.calls.at(-1), ['expand']);
+});
+
+test('session opening, raw-title double-click rename, pin and native archive delegation', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  await app.click(row(tree, 'session:s1'));
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's1']);
+  tree = app.render();
+  row(tree, 'session:s1').props.onDoubleClick(event());
+  assert.deepEqual(app.calls.at(-1), ['rename', 's1', 'First']);
+  row(tree, 'session:blank').props.onDoubleClick(event());
+  assert.equal(app.calls.filter(call => call[0] === 'rename').length, 1);
+  await app.click(button(row(tree, 'session:s1'), 'Pin'));
+  assert.deepEqual(app.calls.at(-1), ['pinSession', 's1']);
+  tree = app.render();
+  await app.click(button(row(tree, 'session:s2'), 'Unpin'));
+  assert.deepEqual(app.calls.at(-1), ['unpinSession', 's2']);
+  tree = app.render();
+  await app.click(button(row(tree, 'session:s1'), 'Archive'));
+  assert.deepEqual(app.calls.at(-1), ['archive-native', 's1']);
+  assert.equal(app.storage.writes, 0);
+});
+
+test('folders keep a title hint; sessions show title and age in a native row hover card', t => {
+  const tree = setup(t).render();
+  assert.equal(nodes(row(tree, 'folder:a'), n => n.props.className === 'dsmgr-label')[0].props.title, 'Alpha');
+  assert.equal(nodes(row(tree, 'session:s1'), n => n.props.className === 'dsmgr-label')[0].props.title, undefined);
+  const card = nodes(tree, n => n.type === 'native-hovercard' && n.props.anchor?.props['data-dsm-key'] === 'session:s1')[0];
+  assert.ok(card);
+  const content = card.props.content;
+  assert.equal(content.props.className, 'dsmgr-hover');
+  assert.deepEqual(content.children.filter(Boolean).map(child => child.children.join('')), ['First', '1m ago']);
+});
+
+test('session navigation remains available while another sidebar action is pending', async t => {
+  const app = setup(t);
+  let finish;
+  app.ctx.uiWorkspace.pinSession = () => new Promise(resolve => { finish = resolve; });
+  await app.click(button(row(app.render(), 'session:s1'), 'Pin'));
+  await app.click(row(app.render(), 'session:s2'));
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's2']);
+  finish();
+  await flush();
+});
+
+test('session navigation failures are visible without blocking the next click', async t => {
+  const app = setup(t);
+  app.ctx.uiWorkspace.openSession = () => Promise.reject(new Error('navigation failed'));
+  await app.click(row(app.render(), 'session:s1'));
+  assert.match(text(app.render()), /Operation failed: navigation failed/);
+  app.ctx.uiWorkspace.openSession = id => app.calls.push(['openSession', id]);
+  await app.click(row(app.render(), 'session:s2'));
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's2']);
+});
+
+test('archived list restores through uiWorkspace without opening or regrouping', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:archived').length, 0);
+  await app.click(button(tree, 'Archived'));
+  tree = app.render();
+  const archived = row(tree, 'session:archived');
+  await app.click(button(archived, 'Restore'));
+  assert.deepEqual(app.calls.at(-1), ['unarchiveSession', 'archived']);
+  assert.equal(app.storage.writes, 0);
+  assert.equal(nodes(tree, node => node.type === 'native-modal').length, 0);
+  await app.click(button(tree, 'Hide archived'));
+  tree = app.render();
+  assert.equal(nodes(tree, node => node.props.className === 'dsmgr-archived-list').length, 0);
+});
+
+test('new session creates fresh identity and persists folder before native navigation', async t => {
+  const app = setup(t);
+  app.ctx.uiWorkspace.openSession = id => {
+    assert.equal(JSON.parse(app.storage.raw).sessionFolders[id], 'a');
+    app.calls.push(['openSession', id]);
+  };
+  const tree = app.render();
+  await app.click(button(row(tree, 'folder:a'), 'New session'));
+  assert.deepEqual(app.calls.slice(-2), [['createSession', { workspaceId: 'w' }], ['openSession', 'created']]);
+  assert.equal(app.calls.some(call => call[0] === 'openWorkspace'), false);
+  assert.equal(JSON.parse(app.storage.raw).sessionFolders.created, 'a');
+  assert.equal(app.storage.writes, 1);
+  assert.equal(app.errors.length, 0);
+});
+
+test('Ctrl multi-selection drags to folder atomically and undo restores mappings', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  await app.click(row(tree, 'session:s1'), { ctrlKey: true });
+  tree = app.render();
+  await app.click(row(tree, 'session:s2'), { ctrlKey: true });
+  tree = app.render();
+  assert.equal(row(tree, 'session:s1').props['aria-selected'], true);
+  assert.equal(row(tree, 'session:s2').props['aria-selected'], true);
+  row(tree, 'session:s1').props.onDragStart(event());
+  row(tree, 'folder:a').props.onDrop(event());
+  assert.deepEqual(JSON.parse(app.storage.raw).sessionFolders, { s1: 'a', s2: 'a' });
+  assert.equal(app.storage.writes, 1);
+  tree = app.render();
+  tree.props.onKeyDown(event({ ctrlKey: true, key: 'z', target: { closest: () => null } }));
+  await flush();
+  assert.deepEqual(JSON.parse(app.storage.raw).sessionFolders, {});
+  assert.equal(app.storage.writes, 2);
+  tree = app.render();
+  assert.match(text(tree), /Move undone/);
+  assert.equal(nodes(tree, node => node.type === 'native-menu').flatMap(node => node.props.items).some(item => item.id === 'undo'), false);
+});
+
+test('Shift selection uses visible row order without opening native session', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  await app.click(row(tree, 'session:s2'), { ctrlKey: true });
+  tree = app.render();
+  await app.click(row(tree, 'session:s1'), { shiftKey: true });
+  tree = app.render();
+  for (const id of ['s1', 's2', 'blank']) assert.equal(row(tree, 'session:' + id).props['aria-selected'], true);
+  assert.equal(app.calls.some(call => call[0] === 'openSession'), false);
+});
+
+test('folder move rejects descendant cycle without persistence change', t => {
+  const state = model.createFolder(fixtureState(), { id: 'child', workspaceId: 'w', parentId: 'a', name: 'Child' });
+  const app = setup(t, { state });
+  const tree = app.render();
+  row(tree, 'folder:a').props.onDragStart(event());
+  row(tree, 'folder:child').props.onDrop(event());
+  assert.equal(app.storage.writes, 0);
+  assert.equal(app.errors.length, 1);
+  assert.match(text(app.render()), /Cannot move a folder into itself/);
+});
+
+test('folder creation and rename dialog save through model and storage', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  const workspace = nodes(tree, node => node.props.className === 'dsmgr-row dsmgr-workspace')[0];
+  await app.click(button(workspace, 'New folder'));
+  tree = app.render();
+  let input = nodes(tree, node => node.type === 'input')[0];
+  input.props.onChange({ target: { value: '  Created folder  ' } });
+  tree = app.render();
+  nodes(tree, node => node.type === 'form')[0].props.onSubmit(event());
+  const created = JSON.parse(app.storage.raw).folders.find(folder => folder.name === 'Created folder');
+  assert.ok(created);
+  assert.equal(created.parentId, null);
+  tree = app.render();
+  await app.click(button(row(tree, 'folder:' + created.id), 'Rename'));
+  tree = app.render();
+  input = nodes(tree, node => node.type === 'input')[0];
+  input.props.onChange({ target: { value: 'Renamed folder' } });
+  tree = app.render();
+  nodes(tree, node => node.type === 'form')[0].props.onSubmit(event());
+  assert.equal(JSON.parse(app.storage.raw).folders.find(folder => folder.id === created.id).name, 'Renamed folder');
+});
+
+test('folder delete-to-root removes subtree mappings without native archival', async t => {
+  let state = model.createFolder(fixtureState(), { id: 'child', workspaceId: 'w', parentId: 'a', name: 'Child' });
+  state = { ...state, sessionFolders: { s1: 'a', s2: 'child', archived: 'a' } };
+  const app = setup(t, { state });
+  let tree = app.render();
+  await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
+  tree = app.render();
+  await confirmDelete(app, false);
+  const persisted = JSON.parse(app.storage.raw);
+  assert.deepEqual(persisted.folders.map(folder => folder.id), ['b']);
+  assert.deepEqual(persisted.sessionFolders, {});
+  assert.equal(app.calls.some(call => call[0] === 'archiveSession' || call[0] === 'archive-native'), false);
+});
+
+test('archive-and-delete uses native safety controller, skips already archived sessions', async t => {
+  const state = { ...fixtureState(), sessionFolders: { s1: 'a', archived: 'a' } };
+  const app = setup(t, { state });
+  let tree = app.render();
+  await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
+  tree = app.render();
+  await confirmDelete(app, true);
+  assert.deepEqual(app.calls.filter(call => call[0] === 'archiveSession'), [['archiveSession', 's1']]);
+  assert.deepEqual(JSON.parse(app.storage.raw).folders.map(folder => folder.id), ['b']);
+});
+
+test('host change from another shell reloads folder state and clears drag undo', t => {
+  const app = setup(t);
+  let tree = app.render();
+  row(tree, 'session:s1').props.onDragStart(event());
+  row(tree, 'folder:a').props.onDrop(event());
+  const external = model.renameFolder(fixtureState(), 'b', 'Other window');
+  app.storage.raw = JSON.stringify(external);
+  app.storage.emit('dsh.session-hub.unrelated', null);
+  assert.match(text(app.render()), /Moved/);
+  app.storage.emit(KEY, null);
+  tree = app.render();
+  assert.equal(nodes(tree, node => node.type === 'native-menu').flatMap(node => node.props.items).some(item => item.id === 'undo'), false);
+  assert.match(text(row(tree, 'folder:b')), /Other window/);
+  tree.props.onKeyDown(event({ ctrlKey: true, key: 'z', target: { closest: () => null } }));
+  assert.equal(app.storage.writes, 1);
+  assert.match(text(tree), /Another window updated folders/);
+});
+
+test('plain sync from another shell reloads silently when there is no undo to lose', t => {
+  const app = setup(t);
+  app.render();
+  app.storage.raw = JSON.stringify(model.renameFolder(fixtureState(), 'b', 'Other window'));
+  app.storage.emit(KEY, null);
+  const tree = app.render();
+  assert.match(text(row(tree, 'folder:b')), /Other window/);
+  assert.doesNotMatch(text(tree), /Another window updated folders/);
+});
+
+test('corrupt host change reports error and keeps rendered last-valid folders', t => {
+  const app = setup(t);
+  app.render();
+  app.storage.raw = '{bad';
+  app.storage.emit(KEY, null);
+  const tree = app.render();
+  assert.ok(row(tree, 'folder:a'));
+  assert.equal(app.errors.length, 1);
+  assert.equal(app.storage.raw, '{bad');
+  assert.equal(app.storage.writes, 0);
+});
+
+test('ungrouped workspace can collapse with a valid persisted empty-id key', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  const ungrouped = nodes(tree, node => node.props.className === 'dsmgr-row dsmgr-workspace').find(node => text(node).includes('Ungrouped'));
+  assert.ok(ungrouped);
+  await app.click(ungrouped);
+  tree = app.render();
+  assert.equal(JSON.parse(app.storage.raw).expanded['workspace:""'], false);
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:orphan').length, 0);
+  assert.equal(app.errors.length, 0);
+});
+
+test('current-session marker follows mainView retention and active native panel', t => {
+  const app = setup(t);
+  let tree = app.render();
+  assert.equal(row(tree, 'session:blank').props['aria-current'], 'page');
+  assert.equal(row(tree, 'session:s1').props['aria-current'], undefined);
+  tree = app.render({ usePanelInfo: selector => selector({ activePanelId: 'settings' }) });
+  assert.equal(row(tree, 'session:blank').props['aria-current'], undefined);
+});
+
+test('running state comes from native status selector, overriding stale list summary', t => {
+  const app = setup(t);
+  const tree = app.render({ useSessionStatus: selector => selector(new Map([['s1', { running: true }]])) });
+  assert.equal(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-status dsmgr-running').length, 1);
+});
+
+test('archive rejection keeps folder assignments and dialog available', async t => {
+  const state = { ...fixtureState(), sessionFolders: { s1: 'a' } };
+  const app = setup(t, { state });
+  app.ctx.uiWorkspace.archiveSession = async () => { throw new Error('Session is running'); };
+  let tree = app.render();
+  await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
+  tree = app.render();
+  await confirmDelete(app, true);
+  assert.deepEqual(JSON.parse(app.storage.raw), state);
+  assert.equal(app.storage.writes, 0);
+  assert.match(text(app.render()), /Session is running/);
+  assert.equal(nodes(app.tree, node => node.type === 'native-checkbox')[0].props.checked, true);
+});
+
+test('partially completed bulk archive retains all folder metadata for recovery', async t => {
+  const state = { ...fixtureState(), sessionFolders: { s1: 'a', s2: 'a', archived: 'a' } };
+  const app = setup(t, { state });
+  const archived = [];
+  app.ctx.uiWorkspace.archiveSession = async id => {
+    if (id === 's2') throw new Error('Second session is running');
+    archived.push(id);
+  };
+  let tree = app.render();
+  await app.click(button(row(tree, 'folder:a'), 'Delete folder'));
+  tree = app.render();
+  await confirmDelete(app, true);
+  assert.deepEqual(archived, ['s1']);
+  assert.deepEqual(JSON.parse(app.storage.raw), state);
+  assert.equal(app.storage.writes, 0);
+  assert.match(text(app.render()), /Second session is running/);
+});
+
+test('failed folder persistence never navigates freshly created session', async t => {
+  const app = setup(t);
+  app.storage.setItem = () => { throw new Error('Quota exceeded'); };
+  const tree = app.render();
+  await app.click(button(row(tree, 'folder:a'), 'New session'));
+  assert.ok(app.calls.some(call => call[0] === 'createSession'));
+  assert.equal(app.calls.some(call => call[0] === 'openSession'), false);
+  assert.equal(app.storage.writes, 0);
+  assert.match(text(app.render()), /Quota exceeded/);
+});
+
+test('search button and native shortcut keep folder mode, merge local and content matches, and cancel stale queries', async t => {
+  const app = setup(t);
+  await app.click(button(app.render(), 'Search sessions'));
+  let tree = app.render();
+  let input = nodes(tree, node => node.type === 'input' && node.props['aria-label'] === 'Search sessions')[0];
+  assert.ok(input);
+  app.sessions.search = async (query, signal) => { app.calls.push(['searchContent', query, signal]); return { ok: true,
+    value: { items: [{ sessionId: 's2', snippet: '<unsafe> body match' }], hasMore: true } }; };
+  input.props.onChange({ target: { value: 'First' } });
+  tree = app.render();
+  assert.ok(row(tree, 'session:s1'));
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:s2').length, 0);
+  await new Promise(resolve => setTimeout(resolve, 280));
+  tree = app.render();
+  assert.ok(row(tree, 'session:s2'));
+  assert.match(text(tree), /<unsafe> body match/);
+  assert.match(text(tree), /Refine your search/);
+  assert.ok(app.entries.get(WORKSPACES).some(entry => entry.options.priority === -10));
+  const signal = app.calls.find(call => call[0] === 'searchContent')[2];
+  input = nodes(tree, node => node.type === 'input')[0];
+  input.props.onKeyDown(event({ key: 'Escape' }));
+  tree = app.render();
+  assert.equal(signal.aborted, true);
+  assert.ok(row(tree, 'folder:a'));
+  app.native.inject().requestSearch();
+  app.render();
+  tree = app.render();
+  assert.ok(nodes(tree, node => node.type === 'input').length);
+  assert.ok(app.entries.get(WORKSPACES).some(entry => entry.options.priority === -10));
+  assert.equal(app.storage.writes, 0);
+});
+
+test('disabled content search shows native-style empty result instead of backend error', async t => {
+  const app = setup(t);
+  const message = 'session search is disabled: openAt never';
+  app.sessions.search = async () => ({ ok: false, error: { message } });
+  await app.click(button(app.render(), 'Search sessions'));
+  nodes(app.render(), node => node.type === 'input')[0].props.onChange({ target: { value: 'no-local-match' } });
+  app.render();
+  await new Promise(resolve => setTimeout(resolve, 280));
+  const tree = app.render();
+  assert.match(text(tree), /No matching sessions/);
+  assert.doesNotMatch(text(tree), /session search is disabled|openAt/);
+  assert.equal(nodes(tree, node => node.props.role === 'alert').length, 0);
+});
+
+test('native search shortcut expands narrow sidebar without changing mode', t => {
+  const app = setup(t);
+  app.render({ wide: false });
+  app.native.inject().requestSearch();
+  app.render({ wide: false });
+  assert.ok(app.calls.some(call => call[0] === 'expand'));
+  const tree = app.render({ wide: true });
+  assert.ok(nodes(tree, node => node.type === 'input').length);
+  assert.ok(app.entries.get(WORKSPACES).some(entry => entry.options.priority === -10));
+});
+
+test('search failures stay in logs, local matches survive, stale replies ignored and query input is bounded', async t => {
+  const app = setup(t);
+  let finish;
+  app.sessions.search = () => new Promise(resolve => { finish = resolve; });
+  await app.click(button(app.render(), 'Search sessions'));
+  let tree = app.render();
+  let input = nodes(tree, node => node.type === 'input')[0];
+  input.props.onChange({ target: { value: 'First' } });
+  app.render();
+  await new Promise(resolve => setTimeout(resolve, 280));
+  tree = app.render();
+  input = nodes(tree, node => node.type === 'input')[0];
+  input.props.onChange({ target: { value: 'Second' } });
+  app.render();
+  finish({ ok: true, value: { items: [{ sessionId: 'orphan', snippet: 'STALE' }], hasMore: false } });
+  await flush();
+  assert.doesNotMatch(text(app.render()), /STALE/);
+  app.sessions.search = async () => ({ ok: false, error: { message: 'Search unavailable' } });
+  await new Promise(resolve => setTimeout(resolve, 280));
+  tree = app.render();
+  assert.doesNotMatch(text(tree), /Search unavailable/);
+  assert.equal(nodes(tree, node => node.props.role === 'alert').length, 0);
+  assert.ok(app.errors.some(args => args.some(value => value?.message === 'Search unavailable')));
+  assert.ok(row(tree, 'session:s2'));
+  input = nodes(tree, node => node.type === 'input')[0];
+  input.props.onChange({ target: { value: '\0' + 'x'.repeat(499) + '😀' } });
+  tree = app.render();
+  const value = nodes(tree, node => node.type === 'input')[0].props.value;
+  assert.equal(value.length, 499);
+  assert.equal(value.includes('\0'), false);
+  assert.equal(app.storage.writes, 0);
+});
+
+test('folder rename uses native modal close handling, selects draft and keeps input undo local', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  row(tree, 'folder:a').props.onDoubleClick(event());
+  tree = app.render();
+  const modal = nodes(tree, node => node.type === 'native-modal')[0];
+  assert.equal(modal.props.open, true);
+  assert.equal(modal.props.closeLabel, 'Close');
+  const input = nodes(modal, node => node.type === 'input')[0];
+  assert.equal(input.props['data-modal-autofocus'], true);
+  let selected = false;
+  input.props.onFocus({ target: { select() { selected = true; } } });
+  assert.equal(selected, true);
+  modal.props.onClose();
+  assert.equal(nodes(app.render(), node => node.type === 'native-modal').length, 0);
+  assert.equal(app.storage.writes, 0);
+});
+
+test('settings switch persists native mode and returns to tree without losing folders or registering footer', async t => {
+  const app = setup(t);
+  assert.equal(app.entries.has('sidebar.footer.action'), false);
+  assert.equal(app.entries.get('settings.section')[0].options.label(), 'Session Manager');
+  let toggle = app.renderToggle();
+  assert.equal(toggle.props.label, 'Use tree view');
+  assert.equal(toggle.props.checked, true);
+  toggle.props.onChange(false);
+  assert.equal(app.storage.mode, 'false');
+  assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
+  app.emit(WORKSPACES);
+  assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
+  toggle = app.renderToggle();
+  assert.equal(toggle.props.checked, false);
+  toggle.props.onChange(true);
+  assert.equal(app.storage.mode, 'true');
+  assert.ok(app.entries.get(WORKSPACES).some(entry => entry.options.priority === -10));
+  assert.match(text(row(app.render(), 'folder:a')), /Alpha/);
+  assert.equal(app.storage.writes, 0);
+  app.cleanup();
+  assert.deepEqual(app.entries.get('settings.section'), []);
+});
+
+test('saved native mode survives initialization and cross-window changes restore tree', t => {
+  const app = setup(t, { mode: 'false' });
+  assert.deepEqual(app.entries.get(WORKSPACES), [app.native]);
+  assert.equal(app.renderToggle().props.checked, false);
+  app.storage.mode = 'true';
+  app.storage.emit('dsh.session-hub.tree-view', null);
+  assert.ok(app.entries.get(WORKSPACES).some(entry => entry.options.priority === -10));
+  assert.equal(app.renderToggle().props.checked, true);
+});
+test('mode write failure leaves tree and saved preference unchanged', t => {
+  const app = setup(t);
+  app.storage.setItem = () => { throw new Error('Storage unavailable'); };
+  app.renderToggle().props.onChange(false);
+  assert.equal(app.renderToggle().props.checked, true);
+  assert.equal(app.storage.mode, null);
+  assert.ok(app.entries.get(WORKSPACES).some(entry => entry.options.priority === -10));
+  assert.ok(app.errors.length);
+});
+
+test('pending interaction wins over running and unread status presentation', t => {
+  const app = setup(t);
+  const tree = app.render({ useSessionStatus: selector => selector(new Map([['s1', {
+    pendingInteraction: { kind: 'approval' }, running: true, completionUnread: true,
+  }]])) });
+  const indicator = nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-status dsmgr-pending')[0];
+  assert.ok(indicator);
+  assert.equal(indicator.props['aria-label'], 'Needs attention: approval');
+  assert.equal(nodes(indicator, node => node.type === 'native-state-dot')[0].props.state, 'warning');
+});
+
+test('unread completion uses native done dot and accessible label, absent on ordinary session', t => {
+  const app = setup(t);
+  const tree = app.render({ useSessionStatus: selector => selector(new Map([['s1', { running: false, completionUnread: true }]])) });
+  const unread = nodes(row(tree, 'session:s1'), node => node.props['aria-label'] === 'Unread completion')[0];
+  assert.ok(unread);
+  assert.equal(nodes(unread, node => node.type === 'native-state-dot')[0].props.state, 'done');
+  assert.equal(nodes(row(tree, 'session:s2'), node => node.props['aria-label'] === 'Unread completion').length, 0);
+});
+
+test('parent subagent count uses direct native catalog, live status precedence and list fallback', t => {
+  const app = setup(t);
+  Object.assign(app.sessions.value.byId, {
+    childLive: { id: 'childLive', running: false },
+    childStopped: { id: 'childStopped', running: true },
+    childFallback: { id: 'childFallback', running: true },
+    unrelated: { id: 'unrelated', parentId: 's1', running: true },
+  });
+  app.sessions.value.projectionsBySession = { s1: { values: { subagentCatalog: [
+    { id: 'childLive' }, { id: 'childStopped' }, { id: 'childFallback' },
+  ] } } };
+  const statuses = new Map([
+    ['s1', { running: false }], ['childLive', { running: true }], ['childStopped', { running: false }],
+  ]);
+  let tree = app.render({ useSessionStatus: selector => selector(statuses) });
+  // The count lives in the status slot label instead of an inline "+N".
+  const label = key => nodes(row(tree, key), node => String(node.props.className).startsWith('dsmgr-status'))[0].props['aria-label'];
+  assert.equal(label('session:s1'), 'Running · 2 running subagents');
+  assert.equal(nodes(tree, node => node.type === 'small').length, 0);
+  assert.equal(label('session:s2'), undefined);
+  app.sessions.value.projectionsBySession.s1.values.subagentCatalog = [];
+  tree = app.render({ useSessionStatus: selector => selector(statuses) });
+  assert.equal(label('session:s1'), undefined);
+});
+
+test('host change uses the latest stored value, a failed write reverts and is shown, and a cleared key resets', t => {
+  const app = setup(t);
+  app.render();
+  const latest = model.renameFolder(fixtureState(), 'a', 'Latest state');
+  app.storage.raw = JSON.stringify(latest);
+  app.storage.emit(KEY, null);
+  assert.match(text(row(app.render(), 'folder:a')), /Latest state/);
+  assert.equal(app.errors.length, 0);
+  app.storage.raw = JSON.stringify(fixtureState());
+  app.storage.emit(KEY, new Error('Changed in another window'));
+  assert.match(text(app.render()), /Operation failed: Changed in another window/);
+  assert.match(text(row(app.render(), 'folder:a')), /Alpha/);
+  assert.equal(app.errors.length, 1);
+  app.storage.raw = null;
+  app.storage.emit(KEY, null);
+  assert.equal(nodes(app.render(), node => node.props['data-dsm-key'] === 'folder:a').length, 0);
+  assert.equal(app.storage.writes, 0);
+});
+
+test('native UI primitives replace glyphs, use themed 14px rows and contain icon-only controls', t => {
+  const app = setup(t);
+  const tree = app.render();
+  assert.equal(nodes(row(tree, 'session:s1'), node => node.type === 'native-state-dot').length, 0);
+  assert.ok(nodes(row(tree, 'session:s2'), node => node.type === 'native-icon' && node.props.name === 'IconPinFillRegular').length);
+  const css = text(nodes(tree, node => node.type === 'style')[0]);
+  assert.match(css, /font:inherit/);
+  assert.match(css, /data-archived=true\]>\.dsmgr-label\{color:var\(--dsw-alias-label-caption\)/);
+  assert.match(css, /--dsw-alias-label-primary/);
+  assert.doesNotMatch(text(tree), /Ctrl-click select|Shift-click range/);
+  assert.equal(text(button(row(tree, 'folder:a'), 'New session')), '');
+  assert.equal(text(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-time')[0]), '1m');
+});
+
+test('nested folder icons cycle tones by depth and native menu exposes new, rename and delete actions', t => {
+  const state = model.createFolder(fixtureState(), { id: 'child', parentId: 'a', workspaceId: 'w', name: 'Child' });
+  const app = setup(t, { state });
+  const tree = app.render();
+  const tone = key => nodes(row(tree, key), node => node.props.className === 'dsmgr-folder-icon')[0].props['data-tone'];
+  assert.deepEqual([tone('folder:a'), tone('folder:child')], [0, 1]);
+  const menus = nodes(row(tree, 'folder:a'), node => node.type === 'native-menu');
+  assert.deepEqual(menus[0].props.items.map(item => item.id), ['folder', 'session', 'rename', 'sort', 'delete']);
+  assert.equal(menus[0].props.portal, true);
+});
+
+test('right-clicking a folder opens its menu at the cursor; sessions open the tag checklist, drafts keep the browser default', t => {
+  const app = setup(t);
+  let prevented = false;
+  row(app.render(), 'folder:a').props.onContextMenu(event({ clientX: 40, clientY: 90, preventDefault() { prevented = true; } }));
+  assert.equal(prevented, true);
+  let menu = nodes(row(app.render(), 'folder:a'), node => node.type === 'native-menu')[0];
+  assert.equal(menu.props.open, true);
+  assert.deepEqual(menu.props.anchorPoint, { x: 40, y: 90 });
+  menu.props.onClose();
+  menu = nodes(row(app.render(), 'folder:a'), node => node.type === 'native-menu')[0];
+  assert.equal(menu.props.open, false);
+  assert.equal(menu.props.anchorPoint, undefined);
+  let draftPrevented = false;
+  row(app.tree, 'session:blank').props.onContextMenu(event({ preventDefault() { draftPrevented = true; } }));
+  assert.equal(draftPrevented, false);
+  row(app.tree, 'session:s1').props.onContextMenu(event({ clientX: 10, clientY: 20, preventDefault() {} }));
+  const tagMenu = nodes(app.render(), node => node.type === 'native-menu' && node.props.items.some(item => item.id === '\0new-tag'))[0];
+  assert.ok(tagMenu, 'Expected tag checklist');
+  assert.deepEqual(tagMenu.props.anchorPoint, { x: 10, y: 20 });
+});
+
+test('session rows have a quick archive button; archived rows get quick restore; drafts get neither', async t => {
+  const app = setup(t);
+  let tree = app.render();
+  const quick = key => nodes(row(tree, key), node => node.type === 'button' && node.props.className === 'dsmgr-icon-button' && node.props['aria-label'] !== 'More actions');
+  await app.click(quick('session:s1')[0]);
+  assert.deepEqual(app.calls.at(-1), ['archive-native', 's1']);
+  assert.equal(quick('session:blank').length, 0);
+  await app.click(button(app.render(), 'Archived'));
+  tree = app.render();
+  assert.equal(quick('session:archived')[0].props['aria-label'], 'Restore');
+});
+
+test('custom folder colors persist, tint the tree through CSS variables and reset to theme defaults', t => {
+  const app = setup(t);
+  const COLORS = 'dsh.session-hub.folder-colors';
+  const pickers = () => nodes(app.renderSettings(), node => node.type === 'button' && node.props.className === 'dsmgr-color');
+  assert.equal(pickers().length, 3);
+  assert.equal(nodes(app.renderSettings(), node => node.type === 'input' && node.props.type === 'color').length, 0);
+  pickers()[1].props.onClick(event());
+  const preset = nodes(app.renderSettings(), node => node.props.className === 'dsmgr-picker-preset' && node.props['aria-label'] === '#0ea5e9')[0];
+  preset.props.onClick();
+  assert.deepEqual(JSON.parse(app.storage.other[COLORS]), [null, '#0ea5e9', null]);
+  const pressed = nodes(app.renderSettings(), node => node.props.className === 'dsmgr-picker-preset' && node.props['aria-pressed'] === true);
+  assert.deepEqual(pressed.map(node => node.props['aria-label']), ['#0ea5e9'], 'the picker stays open and marks the new color');
+  const hex = nodes(app.renderSettings(), node => node.type === 'input' && node.props['aria-label'] === 'Hex')[0];
+  hex.props.onChange({ target: { value: '12345' } });
+  assert.deepEqual(JSON.parse(app.storage.other[COLORS]), [null, '#0ea5e9', null], 'incomplete hex is kept as a draft');
+  hex.props.onChange({ target: { value: '123456' } });
+  assert.deepEqual(JSON.parse(app.storage.other[COLORS]), [null, '#123456', null]);
+  const red = nodes(app.renderSettings(), node => node.type === 'input' && node.props['aria-label'] === 'R')[0];
+  assert.equal(red.props.value, '18');
+  assert.deepEqual(app.render().props.style, { '--dsmgr-tone-1': '#123456' });
+  const reset = nodes(app.renderSettings(), node => node.type === 'button' && text(node) === 'Reset')[0];
+  reset.props.onClick();
+  assert.equal(app.storage.other[COLORS], undefined);
+  assert.deepEqual(app.render().props.style, {});
+  assert.equal(app.storage.writes, 0);
+});
+
+test('archived toggle mixes gray rows into normal ordering and folder, without a separate list or pin priority', async t => {
+  const state = { ...fixtureState(), sessionFolders: { archived: 'a', s1: 'a' } };
+  const app = setup(t, { state });
+  app.sessions.value.byId.archived.updatedAt = 21;
+  app.workspaces.value.pinnedSessionIds.push('archived');
+  let tree = app.render();
+  await app.click(button(tree, 'Archived'));
+  tree = app.render();
+  const archived = row(tree, 'session:archived');
+  assert.equal(archived.props['data-archived'], true);
+  assert.equal(archived.props.style.paddingLeft, row(tree, 'session:s1').props.style.paddingLeft);
+  const order = nodes(tree, node => node.props['data-dsm-key']).map(node => node.props['data-dsm-key']);
+  assert.ok(order.indexOf('session:archived') < order.indexOf('session:s1'));
+  assert.equal(nodes(archived, node => node.props.className === 'dsmgr-pin').length, 0);
+  assert.equal(nodes(tree, node => node.props.className === 'dsmgr-archived-list').length, 0);
+  await app.click(archived);
+  assert.equal(app.calls.some(call => call[0] === 'openSession'), false);
+  assert.match(text(app.render()), /Restore this archived session/);
+  await app.click(button(archived, 'Restore'));
+  assert.deepEqual(app.calls.at(-1), ['unarchiveSession', 'archived']);
+  await app.click(button(app.render(), 'Hide archived'));
+  assert.equal(nodes(app.render(), node => node.props['data-dsm-key'] === 'session:archived').length, 0);
+  assert.deepEqual(JSON.parse(app.storage.raw), state);
+});
+
+test('rendered pagination grows by five and shift selection excludes hidden sessions', async t => {
+  const app = setup(t);
+  for (let i = 0; i < 12; i++) {
+    const id = 'extra' + i;
+    app.sessions.value.ids.push(id);
+    app.sessions.value.byId[id] = { id, title: id, updatedAt: 100 - i };
+    app.workspaces.value.items[0].sessionIds.push(id);
+  }
+  let tree = app.render();
+  const extras = () => nodes(tree, node => node.props['data-dsm-key']?.startsWith('session:extra')).length;
+  assert.equal(extras(), 4); // The pinned s2 takes the first seat; blank does not consume one.
+  assert.equal(nodes(tree, node => node.type === 'native-menu').flatMap(node => node.props.items).some(item => item.id === 'undo'), false);
+  const more = nodes(tree, node => node.props.className === 'dsmgr-overflow')[0];
+  await app.click(more);
+  tree = app.render();
+  assert.equal(extras(), 9);
+  await app.click(row(tree, 'session:extra0'), { ctrlKey: true });
+  tree = app.render();
+  await app.click(row(tree, 'session:extra8'), { shiftKey: true });
+  tree = app.render();
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:extra9').length, 0);
+});
+
+test('tags: checklist toggles persist, rows show dots, header filter narrows the tree, one-shot tags clear on open', async t => {
+  const app = setup(t);
+  const TAGS = 'dsh.session-hub.tags';
+  const saved = () => JSON.parse(app.storage.other[TAGS]).sessions;
+  const tagMenu = () => nodes(app.render(), node => node.type === 'native-menu' && node.props.anchor === null)[0];
+  const openFor = key => row(app.render(), key).props.onContextMenu(event({ clientX: 1, clientY: 2 }));
+  openFor('session:s1');
+  assert.deepEqual(tagMenu().props.items.filter(item => item.id && !item.type).map(item => item.id).slice(0, 2), ['todo', 'revisit']);
+  tagMenu().props.onSelect('todo');
+  tagMenu().props.onSelect('revisit');
+  assert.deepEqual(saved(), { s1: ['todo', 'revisit'] });
+  assert.deepEqual(tagMenu().props.selectedIds, ['todo', 'revisit']);
+  tagMenu().props.onClose();
+  let tree = app.render();
+  assert.equal(nodes(row(tree, 'session:s1'), node => node.props.className === 'dsmgr-tag-dot').length, 2);
+  assert.equal(nodes(row(tree, 'session:s2'), node => node.props.className === 'dsmgr-tags').length, 0);
+  const filter = nodes(tree, node => node.type === 'native-menu' && node.props.anchor?.props['aria-label'] === 'Filter by tag')[0];
+  filter.props.onSelect('todo');
+  tree = app.render();
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:s2').length, 0);
+  assert.ok(nodes(tree, node => node.props.className === 'dsmgr-filter-chip').length);
+  await app.click(row(tree, 'session:s1'));
+  assert.deepEqual(saved(), { s1: ['todo'] });
+  assert.deepEqual(app.calls.at(-1), ['openSession', 's1']);
+});
+
+test('dragging folders: row edges place before/after, a session row places after its parent level', t => {
+  const app = setup(t);
+  let tree = app.render();
+  row(tree, 'folder:b').props.onDragStart(event());
+  row(tree, 'folder:a').props.onDragOver(event({ clientY: 2, dataTransfer: {} }));
+  assert.equal(row(app.render(), 'folder:a').props['data-drop-target'], 'before');
+  row(app.render(), 'folder:a').props.onDrop(event({ clientY: 2 }));
+  assert.deepEqual(JSON.parse(app.storage.raw).folders.map(folder => folder.id), ['b', 'a']);
+  tree = app.render();
+  row(tree, 'folder:b').props.onDragStart(event());
+  row(tree, 'session:s1').props.onDrop(event());
+  assert.deepEqual(JSON.parse(app.storage.raw).folders.map(folder => folder.id), ['a', 'b']);
+  assert.equal(app.storage.writes, 2);
+});
+
+// --- Trash, archive section, folder sorting, move-to-folder and import/export (the merged feature set). ---
+const TRASH = 'dsh.session-hub.trash';
+const ARCHIVE_VIEW = 'dsh.session-hub.archive-view';
+const trashOf = app => JSON.parse(app.storage.other[TRASH]);
+const seeded = entries => JSON.stringify({ version: 1, entries });
+
+test('moving a session to trash records its folder and archives it natively', async t => {
+  const app = setup(t, { state: { ...fixtureState(), sessionFolders: { s1: 'a' } } });
+  let tree = app.render();
+  assert.equal(nodes(tree, node => node.props.className === 'dsmgr-trash').length, 0, 'no empty trash block');
+  await app.click(button(row(tree, 'session:s1'), 'Move to trash'));
+  const saved = trashOf(app);
+  assert.deepEqual(saved.entries.map(entry => [entry.sessionId, entry.workspaceId, entry.folderId]), [['s1', 'w', 'a']]);
+  assert.deepEqual(app.calls.at(-1), ['archiveSession', 's1']);
+  tree = app.render();
+  const entry = row(tree, 'trash:s1');
+  assert.match(text(entry), /First/, 'the trash row shows the session title');
+  assert.match(text(entry), /Work/, 'and the workspace it came from');
+  assert.equal(app.errors.length, 0);
+});
+
+test('a failed native archive rolls the trash record back instead of listing an unarchived session', async t => {
+  const app = setup(t);
+  app.ctx.uiWorkspace.archiveSession = async () => { throw new Error('native archive refused'); };
+  const tree = app.render();
+  await app.click(button(row(tree, 'session:s1'), 'Move to trash'));
+  assert.equal(app.storage.other[TRASH], '{"version":1,"entries":[]}', 'the record list is empty again');
+  assert.match(text(app.render()), /native archive refused/);
+  assert.equal(app.errors.length, 1);
+});
+
+test('restoring a trash record unarchives natively and puts the session back in its folder', async t => {
+  const app = setup(t, { state: fixtureState(), other: {
+    [TRASH]: seeded([{ sessionId: 's1', workspaceId: 'w', folderId: 'a', at: 5 }]) } });
+  const tree = app.render();
+  const entry = row(tree, 'trash:s1');
+  assert.match(text(entry), /1m/, 'the row shows how long ago it was trashed');
+  await app.click(button(entry, 'Restore'));
+  assert.deepEqual(app.calls.find(call => call[0] === 'unarchiveSession'), ['unarchiveSession', 's1']);
+  assert.equal(JSON.parse(app.storage.raw).sessionFolders.s1, 'a');
+  assert.deepEqual(trashOf(app).entries, []);
+  assert.equal(nodes(app.render(), node => node.props.className === 'dsmgr-trash').length, 0);
+});
+
+test('removing a trash record keeps the session and never touches the tree or native archive', async t => {
+  const app = setup(t, { other: { [TRASH]: seeded([{ sessionId: 's1', workspaceId: 'w', folderId: 'a', at: 5 }]) } });
+  const entry = row(app.render(), 'trash:s1');
+  await app.click(button(entry, 'Remove record'));
+  assert.deepEqual(trashOf(app).entries, []);
+  assert.equal(app.storage.writes, 0);
+  assert.equal(app.calls.some(call => call[0] === 'unarchiveSession'), false);
+});
+
+test('the trash header empties records through a confirmation that says sessions are kept', async t => {
+  const app = setup(t, { other: { [TRASH]: seeded([
+    { sessionId: 's1', workspaceId: 'w', folderId: 'a', at: 5 },
+    { sessionId: 'gone', workspaceId: 'w', folderId: null, at: 6 },
+  ]) } });
+  let tree = app.render();
+  assert.match(text(row(tree, 'trash:gone')), /Session no longer exists/, 'a vanished session is still listed');
+  const clear = nodes(tree, node => node.type === 'button' && node.props['aria-label'] === 'Empty')[0];
+  await app.click(clear);
+  tree = app.render();
+  const modal = nodes(tree, node => node.type === 'native-modal')[0];
+  assert.match(text(modal), /Sessions are not deleted/);
+  await app.click(nodes(modal, node => node.type === 'button' && text(node) === 'Empty')[0]);
+  assert.deepEqual(trashOf(app).entries, []);
+  assert.equal(app.calls.some(call => call[0] === 'unarchiveSession'), false);
+});
+
+test('the trash block remembers its collapse state in the tree expanded map', async t => {
+  const app = setup(t, { other: { [TRASH]: seeded([{ sessionId: 's1', workspaceId: 'w', folderId: 'a', at: 5 }]) } });
+  let tree = app.render();
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'trash:s1').length, 1, 'open by default');
+  await app.click(nodes(tree, node => node.props.className === 'dsmgr-row dsmgr-trash-head')[0]);
+  assert.equal(JSON.parse(app.storage.raw).expanded.trash, false);
+  assert.equal(nodes(app.render(), node => node.props['data-dsm-key'] === 'trash:s1').length, 0);
+});
+
+test('archive section mode lists archived sessions per workspace in a collapsible block', async t => {
+  const app = setup(t, { other: { [ARCHIVE_VIEW]: 'section' } });
+  let tree = app.render();
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:archived').length, 0, 'collapsed first');
+  const head = nodes(tree, node => node.props.className === 'dsmgr-row dsmgr-archive-head')[0];
+  assert.equal(text(head), 'Archived (1)');
+  assert.equal(head.props['aria-expanded'], false);
+  await app.click(head);
+  tree = app.render();
+  const archived = row(tree, 'session:archived');
+  assert.equal(archived.props['data-archived'], true);
+  assert.equal(nodes(app.render(), node => node.type === 'native-menu' && node.props.items.some(item => item.id === 'archived')).length, 0,
+    'the inline toggle is gone in section mode');
+  await app.click(button(archived, 'Restore'));
+  assert.deepEqual(app.calls.at(-1), ['unarchiveSession', 'archived']);
+});
+
+test('hidden archive mode keeps archived sessions out of the tree and offers no inline toggle', t => {
+  const app = setup(t, { state: { ...fixtureState(), sessionFolders: { archived: 'a' } }, other: { [ARCHIVE_VIEW]: 'hidden' } });
+  const tree = app.render();
+  assert.equal(nodes(tree, node => node.props['data-dsm-key'] === 'session:archived').length, 0);
+  assert.equal(nodes(tree, node => node.props.className === 'dsmgr-archive-section').length, 0);
+  assert.equal(nodes(tree, node => node.type === 'native-menu' && node.props.items.some(item => item.id === 'archived')).length, 0);
+});
+
+test('the archive-view setting persists its own key and survives a reload', t => {
+  const app = setup(t);
+  const menu = () => nodes(app.renderSettings(), node => node.type === 'native-menu' &&
+    node.props.anchor?.props['aria-label'] === 'Archived sessions')[0];
+  assert.equal(menu().props.selectedId, 'inline');
+  assert.deepEqual(menu().props.items.map(item => item.id), ['inline', 'section', 'hidden']);
+  assert.deepEqual(menu().props.items.map(item => item.label), ['Inline', 'Separate section', 'Hide']);
+  assert.equal(text(menu().props.anchor), 'Inline');
+  menu().props.onSelect('section');
+  assert.equal(app.storage.other[ARCHIVE_VIEW], 'section');
+  assert.equal(menu().props.selectedId, 'section');
+  assert.equal(app.storage.writes, 0, 'the tree key is untouched');
+});
+
+test('the folder menu sorts siblings by position and by name without touching other levels', async t => {
+  let state = fixtureState();
+  state = model.createFolder(state, { id: 'c', workspaceId: 'w', name: 'Aardvark' });
+  state = model.createFolder(state, { id: 'child', workspaceId: 'w', parentId: 'a', name: 'Child' });
+  const app = setup(t, { state });
+  const order = () => JSON.parse(app.storage.raw).folders.map(folder => folder.id);
+  await app.click(button(row(app.render(), 'folder:b'), 'Sort folders'));
+  let tree = app.render();
+  assert.deepEqual(nodes(tree, node => node.props.className === 'dsmgr-move-item').map(text),
+    ['Move to first', 'Move up', 'Move down', 'Move to last', 'Sort by name']);
+  await app.click(button(app.render(), 'Move to last'));
+  assert.deepEqual(order(), ['a', 'c', 'b', 'child'], 'only sibling slots move; the nested folder keeps its slot');
+  await app.click(button(row(app.render(), 'folder:b'), 'Sort folders'));
+  await app.click(button(app.render(), 'Sort by name'));
+  assert.deepEqual(order(), ['c', 'a', 'b', 'child'], 'name sorting rewrites sibling slots only');
+  assert.equal(app.errors.length, 0);
+});
+
+test('the session menus move a session into a folder or back to the workspace root', async t => {
+  const app = setup(t);
+  await app.click(button(row(app.render(), 'session:s1'), 'Move to folder…'));
+  let tree = app.render();
+  assert.deepEqual(nodes(tree, node => node.props.className === 'dsmgr-move-item').map(text),
+    ['Remove from folder (workspace root)', 'Alpha', 'Beta']);
+  await app.click(nodes(tree, node => node.props.className === 'dsmgr-move-item')[2]);
+  assert.equal(JSON.parse(app.storage.raw).sessionFolders.s1, 'b');
+  await app.click(button(row(app.render(), 'session:s1'), 'Move to folder…'));
+  await app.click(nodes(app.render(), node => node.props.className === 'dsmgr-move-item')[0]);
+  assert.equal(Object.prototype.hasOwnProperty.call(JSON.parse(app.storage.raw).sessionFolders, 's1'), false);
+});
+
+test('right-clicking a session offers move-to-folder next to the tag checklist', async t => {
+  const app = setup(t);
+  row(app.render(), 'session:s1').props.onContextMenu(event({ clientX: 5, clientY: 6, preventDefault() {} }));
+  const menu = nodes(app.render(), node => node.type === 'native-menu' && node.props.items.some(item => item.id === '\0new-tag'))[0];
+  assert.ok(menu, 'the tag checklist still opens');
+  assert.equal(menu.props.items.at(-1).label, 'Move to folder…');
+  menu.props.onSelect('\0move-to');
+  const modal = nodes(app.render(), node => node.type === 'native-modal')[0];
+  assert.ok(modal, 'picking it opens the folder picker');
+  assert.deepEqual(nodes(modal, node => node.props.className === 'dsmgr-move-item').map(text).slice(1), ['Alpha', 'Beta']);
+});
+
+test('settings export renders read-only JSON built from the live tree', async t => {
+  const app = setup(t);
+  await app.click(button(app.renderSettings(), 'Export'));
+  const area = nodes(app.renderSettings(), node => node.type === 'textarea')[0];
+  assert.equal(area.props.readOnly, true);
+  const payload = JSON.parse(area.props.value);
+  assert.equal(payload.schema, 'dsh-session-hub/v1');
+  assert.deepEqual(payload.folders.folders.map(folder => folder.id), ['a', 'b']);
+  assert.ok(Array.isArray(payload.tags.tags));
+  assert.equal(app.storage.writes, 0, 'export never writes');
+});
+
+test('settings import merges folders, mappings and tags and reports the summary', async t => {
+  const app = setup(t);
+  const payload = {
+    schema: 'dsh-session-hub/v1', exportedAt: 1,
+    folders: { version: 1, folders: [{ id: 'c', workspaceId: 'w', parentId: null, name: 'Gamma' }], sessionFolders: { s1: 'c' }, expanded: {} },
+    tags: { version: 1, tags: [{ id: 'later', name: 'Later', color: '#22c55e', once: false }], sessions: { s1: ['later'] } },
+    trash: { version: 1, entries: [] },
+    colors: [null, null, null],
+  };
+  await app.click(button(app.renderSettings(), 'Import'));
+  const type = (value) => nodes(app.renderSettings(), node => node.type === 'textarea')[0].props.onChange({ target: { value } });
+  type(JSON.stringify(payload));
+  const modal = nodes(app.renderSettings(), node => node.type === 'native-modal')[0];
+  await app.click(nodes(modal, node => node.type === 'button' && text(node) === 'Import')[0]);
+  const saved = JSON.parse(app.storage.raw);
+  assert.deepEqual(saved.folders.map(folder => folder.id), ['a', 'b', 'c']);
+  assert.equal(saved.sessionFolders.s1, 'c');
+  assert.deepEqual(JSON.parse(app.storage.other['dsh.session-hub.tags']).tags.map(tag => tag.name), ['TODO', 'Revisit', 'Later']);
+  assert.match(text(app.renderSettings()), /Imported 1 folders and 1 tags; skipped 0 items/);
+});
+
+test('a malformed import shows an error and writes nothing', async t => {
+  const app = setup(t);
+  const before = app.storage.raw;
+  await app.click(button(app.renderSettings(), 'Import'));
+  nodes(app.renderSettings(), node => node.type === 'textarea')[0].props.onChange({ target: { value: '{not json' } });
+  const modal = nodes(app.renderSettings(), node => node.type === 'native-modal')[0];
+  await app.click(nodes(modal, node => node.type === 'button' && text(node) === 'Import')[0]);
+  assert.equal(app.storage.raw, before);
+  assert.equal(app.storage.writes, 0);
+  assert.match(text(app.renderSettings()), /Import data could not be parsed/);
+  assert.equal(app.errors.length, 1);
+});

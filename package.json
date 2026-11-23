@@ -1,0 +1,16 @@
+{
+  "name": "@local/dsh-session-hub",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "DSH sidebar session hub: nested folders, multi-select drag, undo, tags, pin, archive section, recoverable trash and import/export — display only, sessions stay untouched.",
+  "keywords": ["deepseek-harness", "dsh", "dsh-plugin", "sessions", "folders", "sidebar", "tags", "trash"],
+  "license": "MIT",
+  "private": true,
+  "exports": { ".": "./index.js", "./client": "./client.js", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "NOTICE.md"],
+  "scripts": { "build": "node build.cjs", "test": "node --test test/*.test.cjs", "check": "node --check client.js && node --check index.js" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true, "inject": ["@deepseek-ai/dsh-client-ui-workspace"] }
+  }
+}
